@@ -60,13 +60,14 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
 </div>
 </div>
 
+<script src="game-config.js"></script>
 <script>
 (() => {
 'use strict';
 
 const canvas=document.getElementById('game');
 const ctx=canvas.getContext('2d');
-const W=canvas.width,H=canvas.height,G=330,WORLD_W=5200;
+const W=canvas.width,H=canvas.height,G=GAME_CONFIG.world.groundY,WORLD_W=GAME_CONFIG.world.width;
 
 // Integration-only asset layer: normalized from the existing Control Lab sprite sheet.
 // Frame order: idle, walk A/B, jump, fire, fire-up, dash, hit.
@@ -92,12 +93,7 @@ async function loadMechFrames(){
 }
 
 
-const SECTORS=[
-  {start:650,end:1250,spawnLead:520,wave:8},
-  {start:1750,end:2400,spawnLead:560,wave:9},
-  {start:2900,end:3600,spawnLead:600,wave:10},
-  {start:4100,end:4800,spawnLead:640,wave:11}
-];
+const SECTORS=GAME_CONFIG.sectors;
 
 /* M3.6.1：第一個架構責任邊界 — InputController。
    行為保持與 M3.4 v7 相同，只把輸入狀態與事件生命週期封裝。 */
@@ -283,14 +279,14 @@ class Player {
 
   update(input,dt,worldWidth){
     if(input.wasPressed('jump') && this.onGround){
-      this.vy=-610;
+      this.vy=-GAME_CONFIG.player.jumpVelocity;
       this.onGround=false;
     }
 
     if(input.wasPressed('dash') && this.dashCooldown<=0){
       this.dir=input.isHeld('left')&&!input.isHeld('right')?-1:1;
-      this.dashRemaining=0.22;
-      this.dashCooldown=0.65;
+      this.dashRemaining=GAME_CONFIG.player.dashDuration;
+      this.dashCooldown=GAME_CONFIG.player.dashCooldown;
     }
 
     // Timers are seconds. Expire them before selecting the frame's velocity,
@@ -300,25 +296,25 @@ class Player {
 
     this.vx=0;
     if(this.dashRemaining>0){
-      this.vx=this.dir*720;
+      this.vx=this.dir*GAME_CONFIG.player.dashSpeed;
     }else{
-      if(input.isHeld('left'))this.vx-=230;
-      if(input.isHeld('right'))this.vx+=230;
+      if(input.isHeld('left'))this.vx-=GAME_CONFIG.player.moveSpeed;
+      if(input.isHeld('right'))this.vx+=GAME_CONFIG.player.moveSpeed;
       if(input.isHeld('right'))this.dir=1;
       if(input.isHeld('left')&&!input.isHeld('right'))this.dir=-1;
     }
 
     if(!this.onGround){
-      this.vy+=1450*dt;
+      this.vy+=GAME_CONFIG.player.gravity*dt;
       this.y+=this.vy*dt;
-      if(this.y>=this.groundY-44){
-        this.y=this.groundY-44;
+      if(this.y>=this.groundY-GAME_CONFIG.player.height){
+        this.y=this.groundY-GAME_CONFIG.player.height;
         this.vy=0;
         this.onGround=true;
       }
     }
 
-    this.x=Math.max(40,Math.min(worldWidth-60,this.x+this.vx*dt));
+    this.x=Math.max(GAME_CONFIG.player.minX,Math.min(worldWidth-GAME_CONFIG.player.maxXOffset,this.x+this.vx*dt));
     this.walk+=Math.abs(this.vx)*dt;
   }
 
@@ -357,13 +353,13 @@ class SectorObjective {
     if(this.mode!=='survive' || phase!=='BATTLE') return;
     surviveSpawnTimer-=dt;
     if(surviveSpawnTimer>0) return;
-    surviveSpawnTimer=0.58;
+    surviveSpawnTimer=GAME_CONFIG.enemies.surviveSpawnInterval;
 
     // SURVIVE spawn positions are constrained by the current Sector.
     // Keep the full enemy body inside the boundary, not just its origin.
     const s=sector();
     const kind=surviveSpawnCount%3===1?'drone':'infantry';
-    const enemyWidth=kind==='drone'?30:32;
+    const enemyWidth=kind==='drone'?GAME_CONFIG.enemies.drone.width:GAME_CONFIG.enemies.infantry.width;
     const minX=s.start+2;
     const maxX=s.end-enemyWidth-2;
     const span=maxX-minX;
@@ -406,7 +402,7 @@ const objective=new SectorObjective();
 function reset(){
   resetCount++;
   resetFlashUntil=performance.now()+350;
-  player=new Player({x:120,y:G-44,groundY:G});
+  player=new Player({x:GAME_CONFIG.player.startX,y:G-GAME_CONFIG.player.height,groundY:G});
   bullets=[];enemies=[];
   sectorIndex=0;phase='APPROACH';sectorStart=0;
   totalSpawn=0;totalClear=0;dashCount=0;lastShot=0;
@@ -424,10 +420,10 @@ function spawnEnemy(kind,x){
   enemies.push({
     kind,
     x,
-    y:drone?145:G-32,
-    w:drone?30:32,
-    h:drone?20:32,
-    hp:2
+    y:drone?GAME_CONFIG.enemies.drone.y:G-GAME_CONFIG.enemies.infantry.height,
+    w:drone?GAME_CONFIG.enemies.drone.width:GAME_CONFIG.enemies.infantry.width,
+    h:drone?GAME_CONFIG.enemies.drone.height:GAME_CONFIG.enemies.infantry.height,
+    hp:GAME_CONFIG.enemies.hitPoints
   });
   totalSpawn++;
 }
@@ -541,16 +537,16 @@ function chooseTarget(){
 }
 
 function fire(){
-  const ox=player.x+18,oy=player.y+22,t=chooseTarget();
-  const tx=t?t.x+t.w/2:ox+420,ty=t?t.y+t.h/2:oy;
+  const ox=player.x+GAME_CONFIG.combat.muzzleOffsetX,oy=player.y+GAME_CONFIG.combat.muzzleOffsetY,t=chooseTarget();
+  const tx=t?t.x+t.w/2:ox+GAME_CONFIG.combat.aimFallbackDistance,ty=t?t.y+t.h/2:oy;
   const a=Math.atan2(ty-oy,tx-ox);
-  bullets.push({x:ox,y:oy,vx:Math.cos(a)*500,vy:Math.sin(a)*500,life:2400});
+  bullets.push({x:ox,y:oy,vx:Math.cos(a)*GAME_CONFIG.combat.bulletSpeed,vy:Math.sin(a)*GAME_CONFIG.combat.bulletSpeed,life:GAME_CONFIG.combat.bulletLifetimeMs});
 }
 
 function update(dt,now){
   player.update(input,dt,WORLD_W);
 
-  if(input.isHeld('fire') && now-lastShot>145){fire();lastShot=now;}
+  if(input.isHeld('fire') && now-lastShot>GAME_CONFIG.combat.fireIntervalMs){fire();lastShot=now;}
 
   maintainSector(now,dt);
 
