@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STEEL STRIDE — Playable Prototype 0.1</title>
+<style>
+html,body{margin:0;background:#101214;color:#ddd;font-family:Consolas,monospace}
+body{display:flex;justify-content:center;padding:18px}
+.wrap{width:min(1000px,100%)}
+h1{font-size:20px;margin:0 0 8px}
+.hint{font-size:13px;line-height:1.55;margin-bottom:10px}
+canvas{display:block;width:100%;max-width:960px;border:2px solid #444;background:#182126;image-rendering:pixelated}
+.panel{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px;font-size:12px}
+.cell{border:1px solid #333;background:#17191b;padding:7px}
+.wide{grid-column:span 4}
+kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
+#inputState{font-weight:700}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0;font-size:12px}
+.toolbar label,.toolbar button{border:1px solid #333;background:#17191b;padding:6px}
+.toolbar select,.toolbar input,.toolbar button{font:inherit;color:#ddd;background:#24282a;border:1px solid #555}
+.toolbar button{cursor:pointer}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>STEEL STRIDE｜Playable Prototype 0.1</h1>
+<div class="hint">
+<b>可玩原型 0.1：</b>復古風格 2D 機甲動作遊戲。此版本保留已驗收的移動、跳躍、衝刺、射擊、自動瞄準與關卡目標機制。
+<br>關卡目標：<b>CLEAR</b> 清空敵兵、<b>SURVIVE</b> 在封鎖區內生存、<b>BREAKTHROUGH</b> 突破前線。上方選單可切換目標模式；碰撞框選項供測試使用。
+<br>操作：<kbd>A</kbd>/<kbd>D</kbd> 移動、<kbd>W</kbd>/<kbd>↑</kbd> 跳、<kbd>J</kbd>/<kbd>Z</kbd>/<kbd>SPACE</kbd> 射擊、<kbd>SHIFT</kbd>/<kbd>K</kbd>/<kbd>X</kbd> 衝刺、<kbd>R</kbd> 重置。
+</div>
+<div class="toolbar">
+  <label>Objective <select id="objectiveSelect"><option value="clear">CLEAR｜清空敵兵</option><option value="survive">SURVIVE｜生存</option><option value="breakthrough" selected>BREAKTHROUGH｜突破</option></select></label>
+  <label>Survive <input id="surviveSeconds" type="number" min="5" max="120" step="5" value="30"> 秒</label>
+  <button id="applyObjective" type="button">套用模式並重置</button>
+  <label><input id="showCollision" type="checkbox">顯示玩家碰撞框</label>
+</div>
+<canvas id="game" width="960" height="420" tabindex="0"></canvas>
+<div class="panel">
+  <div class="cell">Sector <span id="sector">1</span></div>
+  <div class="cell">Phase <span id="phase">APPROACH</span></div>
+  <div class="cell">Player X <span id="px">0</span></div>
+  <div class="cell">Spawn Lead <span id="lead">0</span></div>
+  <div class="cell">Enemies <span id="enemies">0</span></div>
+  <div class="cell">Wave <span id="spawned">0</span>/<span id="waveTotal">0</span></div>
+  <div class="cell">Cleared <span id="cleared">0</span></div>
+  <div class="cell">Dashes <span id="dashes">0</span></div>
+  <div class="cell">Resets <span id="resetCount">0</span></div>
+  <div class="cell">Objective <span id="objectiveMode">BREAKTHROUGH</span></div>
+  <div class="cell">Mech Sprite <span id="spriteState">LOADING</span></div>
+  <div class="cell">Pose Frame <span id="spriteFrame">—</span></div>
+  <div class="cell">Objective Progress <span id="objectiveProgress">—</span></div>
+  <div class="cell wide">Objective Rule：<span id="objectiveDesc">—</span></div>
+  <div class="cell">Last Key <span id="lastKey">—</span></div>
+<div class="cell"><button id="resetButton" type="button">RESET (R)</button></div>
+  <div class="cell wide">INPUT：<span id="inputState">none</span></div>
+<div class="cell wide">ARCH：<span id="archState">InputController + Player + SpriteRenderer + SectorObjective + SurviveLock</span>｜<span id="inputDebug">none</span>｜Dash 0.22s / Cooldown 0.65s｜R=resolved keyup reset（忽略 IME Process/229）</div>
+  <div class="cell wide">Model：CLEAR＝有限波次 + 清空；SURVIVE＝進入戰區後鎖定 Sector + 持續增援 + 計時；BREAKTHROUGH＝有限波次 + 抵達前線。三者僅供設計比較。</div>
+</div>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+const canvas=document.getElementById('game');
+const ctx=canvas.getContext('2d');
+const W=canvas.width,H=canvas.height,G=330,WORLD_W=5200;
+
+// Integration-only asset layer: normalized from the existing Control Lab sprite sheet.
+// Frame order: idle, walk A/B, jump, fire, fire-up, dash, hit.
+const MECH_ATLAS_DATA='assets/mech.png';
+let mechFrames=[];
+let mechReady=false;
+let mechLoadError=false;
+let activeMechFrame=-1;
+async function loadMechFrames(){
+  const img=new Image();
+  await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=MECH_ATLAS_DATA;});
+  if(img.width!==256||img.height!==112) throw new Error('Unexpected mech atlas dimensions');
+  const frames=[];
+  for(let i=0;i<8;i++){
+    const tile=document.createElement('canvas'); tile.width=64; tile.height=56;
+    const c=tile.getContext('2d'); c.imageSmoothingEnabled=false;
+    c.drawImage(img,(i%4)*64,Math.floor(i/4)*56,64,56,0,0,64,56);
+    frames.push(tile);
+  }
+  mechFrames=frames; mechReady=true;
+  const state=document.getElementById('spriteState'); if(state) state.textContent='READY / 8';
+  return true;
+}
+
+
+const SECTORS=[
+  {start:650,end:1250,spawnLead:520,wave:8},
+  {start:1750,end:2400,spawnLead:560,wave:9},
+  {start:2900,end:3600,spawnLead:600,wave:10},
+  {start:4100,end:4800,spawnLead:640,wave:11}
+];
+
+/* M3.6.1：第一個架構責任邊界 — InputController。
+   行為保持與 M3.4 v7 相同，只把輸入狀態與事件生命週期封裝。 */
+class InputController {
+  constructor(targetWindow, targetDocument, focusElement=null){
+    this.window=targetWindow;
+    this.document=targetDocument;
+    this.focusElement=focusElement;
+    this.sources=new Map();
+    this.pressed=new Set();
+    this.commands=new Map();
+    this.bound=false;
+    this.handledEvents=new WeakSet();
+    this.handledKeyUps=new WeakSet();
+
+    this.codeMap={
+      KeyA:'left',ArrowLeft:'left',
+      KeyD:'right',ArrowRight:'right',
+      KeyW:'jump',ArrowUp:'jump',
+      Space:'fire',KeyJ:'fire',KeyZ:'fire',
+      ShiftLeft:'dash',ShiftRight:'dash',KeyK:'dash',KeyX:'dash',
+      KeyR:'reset'
+    };
+    this.keyMap={
+      a:'left',ArrowLeft:'left',
+      d:'right',ArrowRight:'right',
+      w:'jump',ArrowUp:'jump',
+      ' ':'fire',j:'fire',z:'fire',
+      Shift:'dash',k:'dash',x:'dash',
+      r:'reset'
+    };
+
+    this.onKeyDown=this.onKeyDown.bind(this);
+    this.onKeyUp=this.onKeyUp.bind(this);
+    this.onKeyPress=this.onKeyPress.bind(this);
+    this.clear=this.clear.bind(this);
+    this.onVisibilityChange=this.onVisibilityChange.bind(this);
+  }
+
+  bind(){
+    if(this.bound)return;
+    // Bind both document and window. Some browser/host contexts deliver
+    // keyboard events differently; WeakSet prevents double execution.
+    this.document.addEventListener('keydown',this.onKeyDown,{capture:true,passive:false});
+    this.document.addEventListener('keyup',this.onKeyUp,{capture:true,passive:false});
+    this.document.addEventListener('keypress',this.onKeyPress,{capture:true,passive:false});
+    this.window.addEventListener('keydown',this.onKeyDown,{capture:true,passive:false});
+    this.window.addEventListener('keyup',this.onKeyUp,{capture:true,passive:false});
+    this.window.addEventListener('keypress',this.onKeyPress,{capture:true,passive:false});
+    this.window.addEventListener('blur',this.clear);
+    this.document.addEventListener('visibilitychange',this.onVisibilityChange);
+    this.bound=true;
+    this.focusElement?.focus?.({preventScroll:true});
+  }
+
+  resolveAction(e){
+    if(e.code && this.codeMap[e.code]) return this.codeMap[e.code];
+    if(e.key && this.keyMap[e.key]) return this.keyMap[e.key];
+    if((e.keyCode||e.which)===82) return 'reset';
+    return null;
+  }
+
+  onKeyDown(e){
+    document.getElementById('lastKey') && (document.getElementById('lastKey').textContent =
+      `${e.code||'-'} / ${e.key||'-'} / ${e.keyCode||e.which||'-'}`);
+    if(this.handledEvents.has(e))return;
+    this.handledEvents.add(e);
+
+    if(e.target && ['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return;
+    const action=this.resolveAction(e);
+    if(!action)return;
+
+    e.preventDefault();
+    const source='key:'+(e.code||e.key||e.keyCode);
+
+    // Reset is handled on keyup. This supports IME-resolved R events.
+    if(action==='reset'){
+      return;
+    }
+
+    this.sources.set(source,action);
+
+    // Edge events fire only once per physical press.
+    if(!e.repeat)this.pressed.add(action);
+  }
+
+  onKeyUp(e){
+    if(this.handledKeyUps.has(e))return;
+    this.handledKeyUps.add(e);
+
+    const action=this.resolveAction(e);
+    if(!action)return;
+
+    e.preventDefault();
+    this.sources.delete('key:'+(e.code||e.key||e.keyCode));
+
+    // Ignore the intermediate IME Process/229 keyup. Trigger only when the
+    // browser has resolved the key to a real R (82 / "R").
+    const resolvedR =
+      (e.keyCode||e.which)===82 ||
+      (typeof e.key==='string' && e.key.toLowerCase()==='r');
+
+    if(action==='reset' && resolvedR){
+      this.commands.get('reset')?.();
+      return;
+    }
+  }
+
+  onKeyPress(e){
+    // Some host/browser combinations can suppress ordinary keydown handling
+    // while still emitting keypress. Use it only as a reset fallback.
+    const key=typeof e.key==='string'?e.key.toLowerCase():'';
+    if(key!=='r' && e.keyCode!==82 && e.which!==82)return;
+    e.preventDefault();
+    // Reset is handled on keyup.
+  }
+
+  onVisibilityChange(){
+    if(this.document.hidden)this.clear();
+  }
+
+  isHeld(action){
+    for(const value of this.sources.values()){
+      if(value===action)return true;
+    }
+    return false;
+  }
+
+  wasPressed(action){
+    if(!this.pressed.has(action))return false;
+    this.pressed.delete(action);
+    return true;
+  }
+
+  bindCommand(action,handler){
+    if(typeof handler!=='function')throw new TypeError('InputController command handler must be a function');
+    this.commands.set(action,handler);
+  }
+
+  clear(){
+    this.sources.clear();
+    this.pressed.clear();
+  }
+
+  debugState(){
+    return {
+      held:[...new Set(this.sources.values())].sort(),
+      pressed:[...this.pressed].sort()
+    };
+  }
+}
+
+const input=new InputController(window,document,canvas);
+input.bind();
+
+let player,bullets,enemies,sectorIndex,phase,sectorStart,totalSpawn,totalClear,dashCount,lastShot=0;
+let wavePlan=[],waveSpawned=0,waveFinished=false;
+let objectiveMode='breakthrough';
+let objectiveDuration=30;
+let objectiveElapsed=0;
+let surviveSpawnTimer=0;
+let surviveSpawnCount=0;
+let last=null;
+let resetCount=0;
+let resetFlashUntil=0;
+
+/* M3.6.1 第二個架構責任邊界：Player。
+   Player 只負責自身的移動、跳躍、衝刺與物理狀態。
+   不直接知道 Enemy / Sector / Targeting / Score。 */
+class Player {
+  constructor({x,y,groundY}){
+    this.x=x;
+    this.y=y;
+    this.vx=0;
+    this.vy=0;
+    this.onGround=true;
+    this.dir=1;
+    this.dashRemaining=0;
+    this.dashCooldown=0;
+    this.groundY=groundY;
+    this.walk=0; // Visual animation distance only; no gameplay effect.
+  }
+
+  update(input,dt,worldWidth){
+    if(input.wasPressed('jump') && this.onGround){
+      this.vy=-610;
+      this.onGround=false;
+    }
+
+    if(input.wasPressed('dash') && this.dashCooldown<=0){
+      this.dir=input.isHeld('left')&&!input.isHeld('right')?-1:1;
+      this.dashRemaining=0.22;
+      this.dashCooldown=0.65;
+    }
+
+    // Timers are seconds. Expire them before selecting the frame's velocity,
+    // so the exact frame that reaches 0 no longer receives dash velocity.
+    this.dashRemaining=Math.max(0,this.dashRemaining-dt);
+    this.dashCooldown=Math.max(0,this.dashCooldown-dt);
+
+    this.vx=0;
+    if(this.dashRemaining>0){
+      this.vx=this.dir*720;
+    }else{
+      if(input.isHeld('left'))this.vx-=230;
+      if(input.isHeld('right'))this.vx+=230;
+      if(input.isHeld('right'))this.dir=1;
+      if(input.isHeld('left')&&!input.isHeld('right'))this.dir=-1;
+    }
+
+    if(!this.onGround){
+      this.vy+=1450*dt;
+      this.y+=this.vy*dt;
+      if(this.y>=this.groundY-44){
+        this.y=this.groundY-44;
+        this.vy=0;
+        this.onGround=true;
+      }
+    }
+
+    this.x=Math.max(40,Math.min(worldWidth-60,this.x+this.vx*dt));
+    this.walk+=Math.abs(this.vx)*dt;
+  }
+
+  debugState(){
+    return {
+      x:this.x,y:this.y,vx:this.vx,vy:this.vy,
+      onGround:this.onGround,dir:this.dir,
+      dashRemaining:this.dashRemaining,
+      dashCooldown:this.dashCooldown
+    };
+  }
+}
+
+class SectorObjective {
+  constructor(mode='breakthrough',duration=30){
+    this.mode=mode;
+    this.duration=duration;
+  }
+
+  reset(){
+    objectiveElapsed=0;
+    surviveSpawnTimer=0;
+    surviveSpawnCount=0;
+  }
+
+  startSector(){
+    this.reset();
+  }
+
+  update(dt){
+    if(phase!=='BATTLE' && phase!=='CLEANUP') return;
+    if(this.mode==='survive') objectiveElapsed+=dt;
+  }
+
+  maintainSurviveSpawns(dt){
+    if(this.mode!=='survive' || phase!=='BATTLE') return;
+    surviveSpawnTimer-=dt;
+    if(surviveSpawnTimer>0) return;
+    surviveSpawnTimer=0.58;
+
+    // SURVIVE spawn positions are constrained by the current Sector.
+    // Keep the full enemy body inside the boundary, not just its origin.
+    const s=sector();
+    const kind=surviveSpawnCount%3===1?'drone':'infantry';
+    const enemyWidth=kind==='drone'?30:32;
+    const minX=s.start+2;
+    const maxX=s.end-enemyWidth-2;
+    const span=maxX-minX;
+
+    // Distance from the player remains the preferred starting point, but it
+    // may never override the Sector bounds. The growing lane offset wraps
+    // through legal positions instead of clamping every overflow to one edge.
+    const preferredX=Math.max(player.x+300,minX+100)+(surviveSpawnCount*54);
+    const wrapped=((preferredX-minX)%span+span)%span;
+    const x=Math.round(minX+wrapped);
+    spawnEnemy(kind,Math.max(minX,Math.min(maxX,x)));
+    surviveSpawnCount++;
+  }
+
+  isComplete(){
+    if(this.mode==='clear'){
+      return waveFinished && enemies.length===0;
+    }
+    if(this.mode==='survive'){
+      return objectiveElapsed>=this.duration;
+    }
+    return waveFinished && player.x>=sector().end-40;
+  }
+
+  progressText(){
+    if(this.mode==='clear') return `CLEAR ${totalClear}/${wavePlan.length}`;
+    if(this.mode==='survive') return `SURVIVE ${Math.min(this.duration,objectiveElapsed).toFixed(1)} / ${this.duration.toFixed(1)}s (LOCKED)`;
+    return `BREAKTHROUGH ${Math.round(player.x)} / ${sector().end-40}`;
+  }
+
+  description(){
+    if(this.mode==='clear') return '有限波次全部部署後，敵軍清空才完成。';
+    if(this.mode==='survive') return `進入戰區後鎖定於本 Sector 內，敵軍持續增援，撐過 ${this.duration}s 即完成，不要求清空。`;
+    return '有限波次全部部署後，玩家抵達戰區終點即可完成，後方殘敵可保留。';
+  }
+}
+
+const objective=new SectorObjective();
+
+function reset(){
+  resetCount++;
+  resetFlashUntil=performance.now()+350;
+  player=new Player({x:120,y:G-44,groundY:G});
+  bullets=[];enemies=[];
+  sectorIndex=0;phase='APPROACH';sectorStart=0;
+  totalSpawn=0;totalClear=0;dashCount=0;lastShot=0;
+  wavePlan=[];waveSpawned=0;waveFinished=false;
+  objective.reset();
+  input.clear();
+  canvas.focus({preventScroll:true});
+}
+
+function sector(){return SECTORS[sectorIndex];}
+function d2(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+
+function spawnEnemy(kind,x){
+  const drone=kind==='drone';
+  enemies.push({
+    kind,
+    x,
+    y:drone?145:G-32,
+    w:drone?30:32,
+    h:drone?20:32,
+    hp:2
+  });
+  totalSpawn++;
+}
+
+/* 仍採「時間 + 位置」：先在戰區前緣預熱，避免高速玩家跑過才生。 */
+function buildWavePlan(s){
+  wavePlan=[];
+  const count=s.wave;
+  for(let i=0;i<count;i++){
+    const t=count===1?0.5:i/(count-1);
+    wavePlan.push({
+      x:Math.round(s.start+100+t*(s.end-s.start-200)),
+      kind:i%3===1?'drone':'infantry',
+      spawned:false
+    });
+  }
+  waveSpawned=0;
+  waveFinished=false;
+}
+
+function spawnPlannedUntil(playerX){
+  const s=sector();
+  // Position-driven spawning: every planned enemy appears when it is
+  // within spawnLead of the player. This prevents the player from outrunning
+  // the battle line, while keeping the wave finite and deterministic.
+  for(const item of wavePlan){
+    if(!item.spawned && item.x <= playerX+s.spawnLead){
+      spawnEnemy(item.kind,item.x);
+      item.spawned=true;
+      waveSpawned++;
+    }
+  }
+  if(waveSpawned>=wavePlan.length) waveFinished=true;
+}
+
+function advanceToNextSector(now){
+  if(sectorIndex<SECTORS.length-1){
+    sectorIndex++;
+    phase='APPROACH';
+    sectorStart=now;
+    buildWavePlan(sector());
+    objective.startSector();
+    // Immediately pre-spawn if the player is already close enough.
+    spawnPlannedUntil(player.x);
+  }else{
+    phase='COMPLETE';
+  }
+}
+
+function maintainSector(now,dt){
+  const s=sector();
+
+  if(phase==='APPROACH'){
+    buildWavePlan(s);
+    const enterThreshold = objectiveMode==='survive' ? s.start : s.start-s.spawnLead;
+    if(player.x >= enterThreshold){
+      phase='BATTLE';
+      sectorStart=now;
+      objective.startSector();
+      if(objectiveMode==='survive'){
+        wavePlan=[];waveSpawned=0;waveFinished=false;
+        // SURVIVE is a contained battle: the player must remain inside
+        // the current sector until the timer completes.
+        player.x=Math.max(s.start,Math.min(s.end-34,player.x));
+      }else{
+        spawnPlannedUntil(player.x);
+      }
+    }
+    return;
+  }
+
+  if(phase==='BATTLE'){
+    objective.update(dt);
+
+    if(objectiveMode==='survive'){
+      objective.maintainSurviveSpawns(dt);
+      // Lock movement to the current sector while SURVIVE is active.
+      player.x=Math.max(s.start,Math.min(s.end-34,player.x));
+    }else{
+      spawnPlannedUntil(player.x);
+    }
+
+    if(objective.isComplete()){
+      phase='CLEANUP';
+      advanceToNextSector(now);
+    }
+    return;
+  }
+
+  if(phase==='CLEANUP'){
+    // Objective completion already advances immediately. Kept as a visible
+    // transition state for design inspection and future effects.
+    if(objective.isComplete()) advanceToNextSector(now);
+  }
+}
+
+function chooseTarget(){
+  const px=player.x+18;
+  // Auto-target only enemies in the mech's facing direction. A small overlap
+  // tolerance avoids losing a target while the mech and enemy cross paths.
+  // Projectiles already fired keep their original straight-line velocity.
+  const forwardTolerance=18;
+  const candidates=enemies.filter(e=>{
+    const ex=e.x+e.w/2;
+    const inRange=Math.abs(ex-px)<=1200;
+    const inFacingDirection=player.dir>=0 ? ex>=px-forwardTolerance : ex<=px+forwardTolerance;
+    return inRange && inFacingDirection;
+  });
+  candidates.sort((a,b)=>d2({x:px,y:player.y+22},{x:a.x+a.w/2,y:a.y+a.h/2})-d2({x:px,y:player.y+22},{x:b.x+b.w/2,y:b.y+b.h/2}));
+  return candidates[0]||null;
+}
+
+function fire(){
+  const ox=player.x+18,oy=player.y+22,t=chooseTarget();
+  const tx=t?t.x+t.w/2:ox+420,ty=t?t.y+t.h/2:oy;
+  const a=Math.atan2(ty-oy,tx-ox);
+  bullets.push({x:ox,y:oy,vx:Math.cos(a)*500,vy:Math.sin(a)*500,life:2400});
+}
+
+function update(dt,now){
+  player.update(input,dt,WORLD_W);
+
+  if(input.isHeld('fire') && now-lastShot>145){fire();lastShot=now;}
+
+  maintainSector(now,dt);
+
+  for(const b of bullets){
+    b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt*1000;
+    for(const e of enemies){
+      if(Math.abs(b.x-(e.x+e.w/2))<e.w/2+4&&Math.abs(b.y-(e.y+e.h/2))<e.h/2+4){
+        e.hp--;b.life=0;if(e.hp<=0)e.dead=true;break;
+      }
+    }
+  }
+  bullets=bullets.filter(b=>b.life>0);
+
+  const before=enemies.length;
+  enemies=enemies.filter(e=>!e.dead);
+  totalClear+=before-enemies.length;
+}
+
+function draw(){
+  const s=sector();
+  const cam=Math.max(0,Math.min(WORLD_W-W,player.x-260));
+
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#11181d';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#273038';ctx.fillRect(0,G,W,H-G);
+  ctx.fillStyle='#5b6a6f';ctx.fillRect(0,G,W,3);
+
+  for(let i=0;i<SECTORS.length;i++){
+    const z=SECTORS[i];
+    ctx.fillStyle=i===sectorIndex?'#2a3230':'#202629';
+    ctx.fillRect(z.start-cam,70,z.end-z.start,G-70);
+    ctx.fillStyle='#9aa59a';ctx.font='12px Consolas';
+    ctx.fillText('SECTOR '+(i+1),z.start-cam+8,90);
+    ctx.fillStyle='#61696b';ctx.fillRect(z.start-z.warmup-cam,105,2,G-120);
+  }
+
+  const target=chooseTarget();
+  const aimAngle=target?Math.atan2((target.y+target.h/2)-(player.y+22),(target.x+target.w/2)-(player.x+18)):0;
+  if(target){
+    ctx.strokeStyle='#e5e6a9';
+    ctx.strokeRect(target.x-cam-7,target.y-7,target.w+14,target.h+14);
+    ctx.beginPath();ctx.moveTo(player.x-cam+18,player.y+22);ctx.lineTo(target.x-cam+target.w/2,target.y+target.h/2);ctx.stroke();
+  }
+
+  for(const e of enemies){
+    ctx.fillStyle=e.kind==='drone'?'#8e9da0':'#a66e62';
+    ctx.fillRect(e.x-cam,e.y,e.w,e.h);
+    ctx.fillStyle='#292020';ctx.fillRect(e.x-cam+5,e.y+6,e.w-10,5);
+  }
+
+  for(const b of bullets){ctx.fillStyle='#f1e8b8';ctx.fillRect(b.x-cam-2,b.y-2,5,4);}
+
+  // Sprite frame selection is visual-only; player physics/collision coordinates remain unchanged.
+  let pose=0;
+  if(player.dashRemaining>0) pose=6;
+  else if(!player.onGround) pose=3;
+  else if(input.isHeld('fire')) pose=aimAngle<-.22?5:4;
+  else if(Math.abs(player.vx)>8) pose=Math.floor(player.walk/13)%2+1;
+  activeMechFrame=pose;
+  if(mechReady&&mechFrames[pose]){
+    ctx.save();
+    ctx.imageSmoothingEnabled=false;
+    ctx.translate(Math.round(player.x+16-cam),Math.round(player.y+44));
+    ctx.scale(player.dir,1);
+    ctx.drawImage(mechFrames[pose],-32,-56);
+    ctx.restore();
+  }else{
+    ctx.fillStyle='#788b70';ctx.fillRect(player.x-cam,player.y,32,44);
+    ctx.fillStyle='#2f3631';ctx.fillRect(player.x-cam+23,player.y+8,16,7);
+  }
+  if(document.getElementById('showCollision')?.checked){
+    ctx.save();ctx.strokeStyle='#ff6b8a';ctx.lineWidth=1;ctx.setLineDash([4,2]);
+    ctx.strokeRect(Math.round(player.x-cam)+.5,Math.round(player.y)+.5,32,44);ctx.restore();
+  }
+  const spriteStatus=document.getElementById('spriteState');if(spriteStatus)spriteStatus.textContent=mechReady?'READY / 8':(mechLoadError?'LOAD ERROR':'LOADING');
+  const spriteFrame=document.getElementById('spriteFrame');if(spriteFrame)spriteFrame.textContent=String(activeMechFrame);
+
+  ctx.fillStyle='#e8ece7';ctx.font='14px Consolas';
+  ctx.fillText('STEEL STRIDE / PLAYABLE PROTOTYPE 0.1',16,22);
+  ctx.font='12px Consolas';
+  ctx.fillText('A/D MOVE   W/↑ JUMP   J/Z/SPACE FIRE   SHIFT/K/X DASH',16,41);
+
+  const debug=input.debugState();
+  document.getElementById('inputState').textContent=debug.held.join(' + ')||'none';
+  document.getElementById('inputDebug').textContent=
+    `HELD=${debug.held.join(',')||'-'} PRESSED=${debug.pressed.join(',')||'-'} | PLAYER=${Math.round(player.x)},${Math.round(player.y)} v=${Math.round(player.vx)},${Math.round(player.vy)} | RESET=${resetCount}`;
+
+  document.getElementById('sector').textContent=sectorIndex+1;
+  document.getElementById('phase').textContent=phase;
+  document.getElementById('px').textContent=Math.round(player.x);
+  document.getElementById('lead').textContent=Math.round(s.start-player.x);
+  document.getElementById('enemies').textContent=enemies.length;
+  document.getElementById('spawned').textContent=waveSpawned;
+  document.getElementById('waveTotal').textContent=sector().wave;
+  document.getElementById('cleared').textContent=totalClear;
+  document.getElementById('objectiveMode').textContent=objectiveMode.toUpperCase();
+  document.getElementById('objectiveProgress').textContent=objective.progressText();
+  document.getElementById('objectiveDesc').textContent=objective.description();
+  document.getElementById('dashes').textContent=dashCount;
+  document.getElementById('resetCount').textContent=resetCount;
+  document.title = `STEEL STRIDE — Playable Prototype 0.1 — S${sectorIndex+1}`;
+}
+
+function frame(now){
+  if(last===null)last=now;
+  const dt=Math.max(0,Math.min(0.032,(now-last)/1000));last=now;
+  update(dt,now);draw();
+  requestAnimationFrame(frame);
+}
+input.bindCommand('reset',reset);
+document.getElementById('resetButton')?.addEventListener('click',reset);
+
+document.getElementById('applyObjective')?.addEventListener('click',()=>{
+  const mode=document.getElementById('objectiveSelect')?.value || 'breakthrough';
+  const seconds=Number(document.getElementById('surviveSeconds')?.value) || 30;
+  setObjective(mode,seconds);
+});
+
+function setObjective(mode,duration=30){
+  if(!['clear','survive','breakthrough'].includes(mode)) throw new Error('Unknown objective: '+mode);
+  objectiveMode=mode;
+  objectiveDuration=Math.max(5,Math.min(120,Number(duration)||30));
+  objective.mode=objectiveMode;
+  objective.duration=objectiveDuration;
+  reset();
+}
+
+window.__steelStrideInputDebug={
+  state:()=>input.debugState(),
+  dashState:()=>player.debugState(),
+  sectorState:()=>({
+    index:sectorIndex,
+    phase,
+    playerX:player.x,
+    enemiesAlive:enemies.length,
+    waveSpawned,
+    waveTotal:wavePlan.length,
+    waveFinished
+  }),
+  resetCount:()=>resetCount,
+  step:(dt,now=performance.now())=>update(dt,now),
+  keyDown:(code,key='',repeat=false)=>input.onKeyDown({
+    code,key,repeat,target:{tagName:''},preventDefault(){}
+  }),
+  keyUp:(code,key='')=>input.onKeyUp({
+    code,key,target:{tagName:''},preventDefault(){}
+  }),
+  clear:()=>input.clear(),
+  setObjective:(mode,duration=30)=>setObjective(mode,duration),
+  setPlayerX:(x)=>{player.x=Math.max(40,Math.min(WORLD_W-60,Number(x)));},
+  spawnTestEnemy:(kind='infantry',x=900)=>spawnEnemy(kind,Number(x)),
+  killAll:()=>{for(const e of enemies)e.dead=true;},
+  objectiveState:()=>({mode:objectiveMode,duration:objectiveDuration,elapsed:objectiveElapsed,phase,playerX:player.x,sectorStart:sector().start,sectorEnd:sector().end,enemiesAlive:enemies.length,waveSpawned,waveTotal:wavePlan.length,waveFinished,completed:objective.isComplete()}),
+  enemySnapshot:()=>enemies.map(e=>({kind:e.kind,x:e.x,w:e.w,left:e.x,right:e.x+e.w})),
+  targetSnapshot:()=>{const t=chooseTarget();return t?{kind:t.kind,x:t.x,y:t.y,w:t.w,h:t.h}:null;},
+  reset:()=>reset(),
+  stepExact:(dt,now=performance.now())=>update(dt,now),
+  spriteState:()=>({ready:mechReady,loadError:mechLoadError,frame:activeMechFrame,frameCount:mechFrames.length,playerX:player.x,playerY:player.y,walkDistance:player.walk}),
+  renderNow:()=>draw()
+};
+window.__steelStrideIntegrationReady=loadMechFrames().catch(error=>{mechLoadError=true;const state=document.getElementById('spriteState');if(state)state.textContent='LOAD ERROR';console.error('Mech sprite load failed',error);throw error;});
+reset();requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
