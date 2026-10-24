@@ -41,6 +41,7 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
   <div class="cell">Sector <span id="sector">1</span></div>
   <div class="cell">Phase <span id="phase">APPROACH</span></div>
   <div class="cell">Player X <span id="px">0</span></div>
+  <div class="cell">Player HP <span id="playerHp">3 / 3</span></div>
   <div class="cell">Spawn Lead <span id="lead">0</span></div>
   <div class="cell">Enemies <span id="enemies">0</span></div>
   <div class="cell">Wave <span id="spawned">0</span>/<span id="waveTotal">0</span></div>
@@ -72,10 +73,31 @@ const W=canvas.width,H=canvas.height,G=GAME_CONFIG.world.groundY,WORLD_W=GAME_CO
 // Integration-only asset layer: normalized from the existing Control Lab sprite sheet.
 // Frame order: idle, walk A/B, jump, fire, fire-up, dash, hit.
 const MECH_ATLAS_DATA='assets/mech.png';
+const HIT_SPRITE_DATA='assets/TYPE-01_Hit_64x56_v0_5.png';
+const DEATH_SPRITE_DATA='assets/TYPE-01_Death_Explosion_64x56_v0_1.png';
+const PLAYER_MAX_HP=3; // Test default; adjust after playtest if needed.
+const HIT_DURATION_MS=200;
+const PLAYER_INVULNERABLE_MS=1000;
+const DEATH_EXPLOSION_MS=650;
+const ENEMY_EXPLOSION_MS=500;
+let hitFrame=null,deathFrame=null,playerDeathUntil=0,playerRemoved=false;
 let mechFrames=[];
 let mechReady=false;
 let mechLoadError=false;
 let activeMechFrame=-1;
+async function loadSingleSprite(src){
+  const img=new Image();
+  await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=src;});
+  if(img.width!==64||img.height!==56) throw new Error('Unexpected state sprite dimensions: '+src);
+  const tile=document.createElement('canvas');tile.width=64;tile.height=56;
+  const c=tile.getContext('2d');c.imageSmoothingEnabled=false;c.drawImage(img,0,0);
+  return tile;
+}
+async function loadStateSprites(){
+  const [hit,death]=await Promise.all([loadSingleSprite(HIT_SPRITE_DATA),loadSingleSprite(DEATH_SPRITE_DATA)]);
+  hitFrame=hit;deathFrame=death;
+  return true;
+}
 async function loadMechFrames(){
   const img=new Image();
   await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=MECH_ATLAS_DATA;});
@@ -275,9 +297,14 @@ class Player {
     this.dashCooldown=0;
     this.groundY=groundY;
     this.walk=0; // Visual animation distance only; no gameplay effect.
+    this.hp=PLAYER_MAX_HP;
+    this.invulnerableUntil=0;
+    this.hitUntil=0;
+    this.dead=false;
   }
 
   update(input,dt,worldWidth){
+    if(this.dead) return;
     if(input.wasPressed('jump') && this.onGround){
       this.vy=-GAME_CONFIG.player.jumpVelocity;
       this.onGround=false;
@@ -403,7 +430,7 @@ function reset(){
   resetCount++;
   resetFlashUntil=performance.now()+350;
   player=new Player({x:GAME_CONFIG.player.startX,y:G-GAME_CONFIG.player.height,groundY:G});
-  bullets=[];enemies=[];
+  bullets=[];enemies=[];playerDeathUntil=0;playerRemoved=false;
   sectorIndex=0;phase='APPROACH';sectorStart=0;
   totalSpawn=0;totalClear=0;dashCount=0;lastShot=0;
   wavePlan=[];waveSpawned=0;waveFinished=false;
@@ -423,7 +450,8 @@ function spawnEnemy(kind,x){
     y:drone?GAME_CONFIG.enemies.drone.y:G-GAME_CONFIG.enemies.infantry.height,
     w:drone?GAME_CONFIG.enemies.drone.width:GAME_CONFIG.enemies.infantry.width,
     h:drone?GAME_CONFIG.enemies.drone.height:GAME_CONFIG.enemies.infantry.height,
-    hp:GAME_CONFIG.enemies.hitPoints
+    hp:GAME_CONFIG.enemies.hitPoints,
+    dead:false, deathUntil:0
   });
   totalSpawn++;
 }
@@ -527,6 +555,7 @@ function chooseTarget(){
   // Projectiles already fired keep their original straight-line velocity.
   const forwardTolerance=18;
   const candidates=enemies.filter(e=>{
+    if(e.dead) return false;
     const ex=e.x+e.w/2;
     const inRange=Math.abs(ex-px)<=1200;
     const inFacingDirection=player.dir>=0 ? ex>=px-forwardTolerance : ex<=px+forwardTolerance;
@@ -543,27 +572,53 @@ function fire(){
   bullets.push({x:ox,y:oy,vx:Math.cos(a)*GAME_CONFIG.combat.bulletSpeed,vy:Math.sin(a)*GAME_CONFIG.combat.bulletSpeed,life:GAME_CONFIG.combat.bulletLifetimeMs});
 }
 
+function overlaps(a,b){
+  return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+}
+function damagePlayer(now){
+  if(player.dead || now < player.invulnerableUntil) return;
+  player.hp=Math.max(0,player.hp-1);
+  player.hitUntil=now+HIT_DURATION_MS;
+  player.invulnerableUntil=now+PLAYER_INVULNERABLE_MS;
+  if(player.hp===0){
+    player.dead=true;
+    playerDeathUntil=now+DEATH_EXPLOSION_MS;
+  }
+}
 function update(dt,now){
-  player.update(input,dt,WORLD_W);
+  if(!player.dead) player.update(input,dt,WORLD_W);
 
-  if(input.isHeld('fire') && now-lastShot>GAME_CONFIG.combat.fireIntervalMs){fire();lastShot=now;}
+  if(!player.dead && input.isHeld('fire') && now-lastShot>GAME_CONFIG.combat.fireIntervalMs){fire();lastShot=now;}
 
-  maintainSector(now,dt);
+  if(!player.dead) maintainSector(now,dt);
 
   for(const b of bullets){
     b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt*1000;
     for(const e of enemies){
+      if(e.dead) continue;
       if(Math.abs(b.x-(e.x+e.w/2))<e.w/2+4&&Math.abs(b.y-(e.y+e.h/2))<e.h/2+4){
-        e.hp--;b.life=0;if(e.hp<=0)e.dead=true;break;
+        e.hp--;b.life=0;
+        if(e.hp<=0){e.dead=true;e.deathUntil=now+ENEMY_EXPLOSION_MS;}
+        break;
       }
     }
   }
   bullets=bullets.filter(b=>b.life>0);
 
+  // Enemy contact causes one HP damage; invulnerability prevents repeated frame damage.
+  if(!player.dead && now>=player.invulnerableUntil){
+    const playerBox={x:player.x+4,y:player.y+4,w:24,h:40};
+    if(enemies.some(e=>!e.dead&&overlaps(playerBox,{x:e.x,y:e.y,w:e.w,h:e.h}))) damagePlayer(now);
+  }
+
+  // Keep dead enemies in the world for the explosion window, then count them as cleared.
   const before=enemies.length;
-  enemies=enemies.filter(e=>!e.dead);
+  enemies=enemies.filter(e=>!e.dead || now<e.deathUntil);
   totalClear+=before-enemies.length;
+  if(player.dead && !playerRemoved && now>=playerDeathUntil) playerRemoved=true;
 }
+
+function nowForDraw(){return performance.now();}
 
 function draw(){
   const s=sector();
@@ -592,6 +647,7 @@ function draw(){
   }
 
   for(const e of enemies){
+    if(e.dead){if(deathFrame){ctx.save();ctx.imageSmoothingEnabled=false;ctx.drawImage(deathFrame,Math.round(e.x-cam+(e.w-64)/2),Math.round(e.y+(e.h-56)/2));ctx.restore();}continue;}
     ctx.fillStyle=e.kind==='drone'?'#8e9da0':'#a66e62';
     ctx.fillRect(e.x-cam,e.y,e.w,e.h);
     ctx.fillStyle='#292020';ctx.fillRect(e.x-cam+5,e.y+6,e.w-10,5);
@@ -606,13 +662,16 @@ function draw(){
   else if(input.isHeld('fire')) pose=aimAngle<-.22?5:4;
   else if(Math.abs(player.vx)>8) pose=Math.floor(player.walk/13)%2+1;
   activeMechFrame=pose;
-  if(mechReady&&mechFrames[pose]){
-    ctx.save();
-    ctx.imageSmoothingEnabled=false;
-    ctx.translate(Math.round(player.x+16-cam),Math.round(player.y+44));
-    ctx.scale(player.dir,1);
-    ctx.drawImage(mechFrames[pose],-32,-56);
-    ctx.restore();
+  if(player.dead){
+    if(!playerRemoved && deathFrame){ctx.save();ctx.imageSmoothingEnabled=false;ctx.drawImage(deathFrame,Math.round(player.x+16-cam-32),Math.round(player.y+44-56));ctx.restore();}
+  }else if(nowForDraw() < player.hitUntil && hitFrame){
+    ctx.save();ctx.imageSmoothingEnabled=false;ctx.translate(Math.round(player.x+16-cam),Math.round(player.y+44));ctx.scale(player.dir,1);ctx.drawImage(hitFrame,-32,-56);ctx.restore();
+  }else if(mechReady&&mechFrames[pose]){
+    // Blink during the 1-second invulnerability window, without affecting collision or movement.
+    const t=performance.now();
+    if(t>=player.invulnerableUntil || Math.floor(t/90)%2===0){
+      ctx.save();ctx.imageSmoothingEnabled=false;ctx.translate(Math.round(player.x+16-cam),Math.round(player.y+44));ctx.scale(player.dir,1);ctx.drawImage(mechFrames[pose],-32,-56);ctx.restore();
+    }
   }else{
     ctx.fillStyle='#788b70';ctx.fillRect(player.x-cam,player.y,32,44);
     ctx.fillStyle='#2f3631';ctx.fillRect(player.x-cam+23,player.y+8,16,7);
@@ -642,6 +701,7 @@ function draw(){
   document.getElementById('spawned').textContent=waveSpawned;
   document.getElementById('waveTotal').textContent=sector().wave;
   document.getElementById('cleared').textContent=totalClear;
+  const hpEl=document.getElementById('playerHp');if(hpEl)hpEl.textContent=`${player.hp} / ${PLAYER_MAX_HP}`+(player.dead?(playerRemoved?'｜已移除':'｜爆炸中'):'');
   document.getElementById('objectiveMode').textContent=objectiveMode.toUpperCase();
   document.getElementById('objectiveProgress').textContent=objective.progressText();
   document.getElementById('objectiveDesc').textContent=objective.description();
@@ -681,6 +741,7 @@ window.__steelStrideInputDebug={
     index:sectorIndex,
     phase,
     playerX:player.x,
+    playerHp:player.hp,playerDead:player.dead,playerRemoved,invulnerableUntil:player.invulnerableUntil,
     enemiesAlive:enemies.length,
     waveSpawned,
     waveTotal:wavePlan.length,
@@ -700,14 +761,15 @@ window.__steelStrideInputDebug={
   spawnTestEnemy:(kind='infantry',x=900)=>spawnEnemy(kind,Number(x)),
   killAll:()=>{for(const e of enemies)e.dead=true;},
   objectiveState:()=>({mode:objectiveMode,duration:objectiveDuration,elapsed:objectiveElapsed,phase,playerX:player.x,sectorStart:sector().start,sectorEnd:sector().end,enemiesAlive:enemies.length,waveSpawned,waveTotal:wavePlan.length,waveFinished,completed:objective.isComplete()}),
-  enemySnapshot:()=>enemies.map(e=>({kind:e.kind,x:e.x,w:e.w,left:e.x,right:e.x+e.w})),
+  enemySnapshot:()=>enemies.map(e=>({kind:e.kind,x:e.x,w:e.w,hp:e.hp,dead:e.dead,deathUntil:e.deathUntil,left:e.x,right:e.x+e.w})),
+  playerCombatState:()=>({hp:player.hp,maxHp:PLAYER_MAX_HP,dead:player.dead,removed:playerRemoved,invulnerableUntil:player.invulnerableUntil,hitUntil:player.hitUntil}),
   targetSnapshot:()=>{const t=chooseTarget();return t?{kind:t.kind,x:t.x,y:t.y,w:t.w,h:t.h}:null;},
   reset:()=>reset(),
   stepExact:(dt,now=performance.now())=>update(dt,now),
   spriteState:()=>({ready:mechReady,loadError:mechLoadError,frame:activeMechFrame,frameCount:mechFrames.length,playerX:player.x,playerY:player.y,walkDistance:player.walk}),
   renderNow:()=>draw()
 };
-window.__steelStrideIntegrationReady=loadMechFrames().catch(error=>{mechLoadError=true;const state=document.getElementById('spriteState');if(state)state.textContent='LOAD ERROR';console.error('Mech sprite load failed',error);throw error;});
+window.__steelStrideIntegrationReady=Promise.all([loadMechFrames(),loadStateSprites()]).catch(error=>{mechLoadError=true;const state=document.getElementById('spriteState');if(state)state.textContent='LOAD ERROR';console.error('Sprite load failed',error);throw error;});
 reset();requestAnimationFrame(frame);
 })();
 </script>
