@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>STEEL STRIDE — Playable Prototype 0.1</title>
+<title>STEEL STRIDE — M7-A Drone Attack Integration Candidate v1</title>
 <style>
 html,body{margin:0;background:#101214;color:#ddd;font-family:Consolas,monospace}
 body{display:flex;justify-content:center;padding:18px}
@@ -24,9 +24,9 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
 </head>
 <body>
 <div class="wrap">
-<h1>STEEL STRIDE｜Playable Prototype 0.1</h1>
+<h1>STEEL STRIDE｜M7-A 飛行無人機攻擊整合候選版 v1</h1>
 <div class="hint">
-<b>可玩原型 0.1：</b>復古風格 2D 機甲動作遊戲。此版本保留已驗收的移動、跳躍、衝刺、射擊、自動瞄準與關卡目標機制。
+<b>M7-A 整合候選版：</b>以已驗收的 M6 正式遊戲基準為底，只整合已通過獨立測試的飛行無人機遠距攻擊。此版本供正式遊戲回歸測試，不代表已驗收或已提交。
 <br>關卡目標：<b>CLEAR</b> 清空敵兵、<b>SURVIVE</b> 在封鎖區內生存、<b>BREAKTHROUGH</b> 突破前線。上方選單可切換目標模式；碰撞框選項供測試使用。
 <br>操作：<kbd>A</kbd>/<kbd>D</kbd> 移動、<kbd>W</kbd>/<kbd>↑</kbd> 跳、<kbd>J</kbd>/<kbd>Z</kbd>/<kbd>SPACE</kbd> 射擊、<kbd>SHIFT</kbd>/<kbd>K</kbd>/<kbd>X</kbd> 衝刺、<kbd>R</kbd> 重置。
 </div>
@@ -271,7 +271,7 @@ class InputController {
 const input=new InputController(window,document,canvas);
 input.bind();
 
-let player,bullets,enemies,sectorIndex,phase,sectorStart,totalSpawn,totalClear,dashCount,lastShot=0;
+let player,bullets,enemies,enemyBullets,sectorIndex,phase,sectorStart,totalSpawn,totalClear,dashCount,lastShot=0;
 let wavePlan=[],waveSpawned=0,waveFinished=false;
 let objectiveMode='breakthrough';
 let objectiveDuration=30;
@@ -430,7 +430,7 @@ function reset(){
   resetCount++;
   resetFlashUntil=performance.now()+350;
   player=new Player({x:GAME_CONFIG.player.startX,y:G-GAME_CONFIG.player.height,groundY:G});
-  bullets=[];enemies=[];playerDeathUntil=0;playerRemoved=false;
+  bullets=[];enemies=[];enemyBullets=[];playerDeathUntil=0;playerRemoved=false;
   sectorIndex=0;phase='APPROACH';sectorStart=0;
   totalSpawn=0;totalClear=0;dashCount=0;lastShot=0;
   wavePlan=[];waveSpawned=0;waveFinished=false;
@@ -451,6 +451,7 @@ function spawnEnemy(kind,x){
     w:drone?GAME_CONFIG.enemies.drone.width:GAME_CONFIG.enemies.infantry.width,
     h:drone?GAME_CONFIG.enemies.drone.height:GAME_CONFIG.enemies.infantry.height,
     hp:GAME_CONFIG.enemies.hitPoints,
+    nextShotAt:performance.now()+1800,
     dead:false, deathUntil:0
   });
   totalSpawn++;
@@ -585,12 +586,28 @@ function damagePlayer(now){
     playerDeathUntil=now+DEATH_EXPLOSION_MS;
   }
 }
+function updateDroneAttacks(now){
+  if(phase!=='BATTLE' || player.dead) return;
+  const s=sector();
+  for(const e of enemies){
+    if(e.dead || e.kind!=='drone') continue;
+    if(e.x+e.w<s.start || e.x>s.end) continue;
+    if(now < e.nextShotAt) continue;
+    const targetX=player.x+16;
+    const direction=targetX < e.x+e.w/2 ? -1 : 1;
+    // Horizontal projectile; sample the player's centerline at firing time.
+    enemyBullets.push({x:e.x+e.w/2,y:player.y+22,vx:direction*180,life:3000,damage:1});
+    e.nextShotAt=now+1800;
+  }
+}
+
 function update(dt,now){
   if(!player.dead) player.update(input,dt,WORLD_W);
 
   if(!player.dead && input.isHeld('fire') && now-lastShot>GAME_CONFIG.combat.fireIntervalMs){fire();lastShot=now;}
 
   if(!player.dead) maintainSector(now,dt);
+  updateDroneAttacks(now);
 
   for(const b of bullets){
     b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt*1000;
@@ -604,6 +621,18 @@ function update(dt,now){
     }
   }
   bullets=bullets.filter(b=>b.life>0);
+
+  const playerBoxForProjectile={x:player.x+4,y:player.y+4,w:24,h:40};
+  for(const b of enemyBullets){
+    b.x+=b.vx*dt;
+    b.life-=dt*1000;
+    if(!b.hit && !player.dead && overlaps(playerBoxForProjectile,{x:b.x-5,y:b.y-3,w:10,h:6})){
+      damagePlayer(now);
+      b.hit=true;
+      b.life=0;
+    }
+  }
+  enemyBullets=enemyBullets.filter(b=>b.life>0 && b.x>=0 && b.x<=WORLD_W);
 
   // Enemy contact causes one HP damage; invulnerability prevents repeated frame damage.
   if(!player.dead && now>=player.invulnerableUntil){
@@ -654,6 +683,7 @@ function draw(){
   }
 
   for(const b of bullets){ctx.fillStyle='#f1e8b8';ctx.fillRect(b.x-cam-2,b.y-2,5,4);}
+  for(const b of enemyBullets){ctx.fillStyle='#ff5d73';ctx.fillRect(Math.round(b.x-cam-5),Math.round(b.y-3),10,6);ctx.fillStyle='#ffd3d8';ctx.fillRect(Math.round(b.x-cam-2),Math.round(b.y-1),4,2);}
 
   // Sprite frame selection is visual-only; player physics/collision coordinates remain unchanged.
   let pose=0;
@@ -707,7 +737,7 @@ function draw(){
   document.getElementById('objectiveDesc').textContent=objective.description();
   document.getElementById('dashes').textContent=dashCount;
   document.getElementById('resetCount').textContent=resetCount;
-  document.title = `STEEL STRIDE — Playable Prototype 0.1 — S${sectorIndex+1}`;
+  document.title = `STEEL STRIDE — M7-A Integration Candidate — S${sectorIndex+1}`;
 }
 
 function frame(now){
