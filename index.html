@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>STEEL STRIDE — M7-A Drone Attack Integration Candidate v1</title>
+<title>STEEL STRIDE — M7-B.1 Formal Integration Candidate v1</title>
 <style>
 html,body{margin:0;background:#101214;color:#ddd;font-family:Consolas,monospace}
 body{display:flex;justify-content:center;padding:18px}
@@ -24,9 +24,9 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
 </head>
 <body>
 <div class="wrap">
-<h1>STEEL STRIDE｜M7-A 飛行無人機攻擊整合候選版 v1</h1>
+<h1>STEEL STRIDE｜M7-B.1 敵人資料模型正式整合候選版 v1</h1>
 <div class="hint">
-<b>M7-A 整合候選版：</b>以已驗收的 M6 正式遊戲基準為底，只整合已通過獨立測試的飛行無人機遠距攻擊。此版本供正式遊戲回歸測試，不代表已驗收或已提交。
+<b>M7-B.1 正式整合候選版：</b>以使用者提供的 STEEL_STRIDE_GAME main（M7-A 已整合基準）為底，選擇性整合已驗收的敵人資料模型、無人機水平巡邏與朝玩家發射瞬間位置瞄準的直線投射物。步兵維持接觸攻擊。此候選版尚待正式遊戲回歸測試，不代表已驗收或已提交。
 <br>關卡目標：<b>CLEAR</b> 清空敵兵、<b>SURVIVE</b> 在封鎖區內生存、<b>BREAKTHROUGH</b> 突破前線。上方選單可切換目標模式；碰撞框選項供測試使用。
 <br>操作：<kbd>A</kbd>/<kbd>D</kbd> 移動、<kbd>W</kbd>/<kbd>↑</kbd> 跳、<kbd>J</kbd>/<kbd>Z</kbd>/<kbd>SPACE</kbd> 射擊、<kbd>SHIFT</kbd>/<kbd>K</kbd>/<kbd>X</kbd> 衝刺、<kbd>R</kbd> 重置。
 </div>
@@ -35,6 +35,7 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
   <label>Survive <input id="surviveSeconds" type="number" min="5" max="120" step="5" value="30"> 秒</label>
   <button id="applyObjective" type="button">套用模式並重置</button>
   <label><input id="showCollision" type="checkbox">顯示玩家碰撞框</label>
+  <label>無人機射擊間隔 <input id="droneFireInterval" type="range" min="600" max="3000" step="100" value="1800"> <span id="droneFireIntervalValue">1800</span> ms</label>
 </div>
 <canvas id="game" width="960" height="420" tabindex="0"></canvas>
 <div class="panel">
@@ -56,7 +57,7 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
   <div class="cell">Last Key <span id="lastKey">—</span></div>
 <div class="cell"><button id="resetButton" type="button">RESET (R)</button></div>
   <div class="cell wide">INPUT：<span id="inputState">none</span></div>
-<div class="cell wide">ARCH：<span id="archState">InputController + Player + SpriteRenderer + SectorObjective + SurviveLock</span>｜<span id="inputDebug">none</span>｜Dash 0.22s / Cooldown 0.65s｜R=resolved keyup reset（忽略 IME Process/229）</div>
+<div class="cell wide">ARCH：<span id="archState">InputController + Player + SpriteRenderer + SectorObjective + SurviveLock</span>｜<span id="inputDebug">none</span>｜Dash 0.22s / Cooldown 0.65s｜R=keydown edge reset（忽略按住重複觸發）</div>
   <div class="cell wide">Model：CLEAR＝有限波次 + 清空；SURVIVE＝進入戰區後鎖定 Sector + 持續增援 + 計時；BREAKTHROUGH＝有限波次 + 抵達前線。三者僅供設計比較。</div>
 </div>
 </div>
@@ -191,8 +192,11 @@ class InputController {
     e.preventDefault();
     const source='key:'+(e.code||e.key||e.keyCode);
 
-    // Reset is handled on keyup. This supports IME-resolved R events.
+    // Reset on the first keydown edge. Handling it on keyup can fail when
+    // the browser/IME reports Process/229 or does not deliver a resolved R keyup.
+    // Ignore key repeat so holding R cannot reset the game every frame.
     if(action==='reset'){
+      if(!e.repeat) this.commands.get('reset')?.();
       return;
     }
 
@@ -212,16 +216,8 @@ class InputController {
     e.preventDefault();
     this.sources.delete('key:'+(e.code||e.key||e.keyCode));
 
-    // Ignore the intermediate IME Process/229 keyup. Trigger only when the
-    // browser has resolved the key to a real R (82 / "R").
-    const resolvedR =
-      (e.keyCode||e.which)===82 ||
-      (typeof e.key==='string' && e.key.toLowerCase()==='r');
-
-    if(action==='reset' && resolvedR){
-      this.commands.get('reset')?.();
-      return;
-    }
+    // Reset is handled on keydown; keyup only clears input bookkeeping.
+    if(action==='reset') return;
   }
 
   onKeyPress(e){
@@ -272,6 +268,7 @@ const input=new InputController(window,document,canvas);
 input.bind();
 
 let player,bullets,enemies,enemyBullets,sectorIndex,phase,sectorStart,totalSpawn,totalClear,dashCount,lastShot=0;
+let droneFireIntervalMs=GAME_CONFIG.enemyTypes.drone.attack.cooldownMs;
 let wavePlan=[],waveSpawned=0,waveFinished=false;
 let objectiveMode='breakthrough';
 let objectiveDuration=30;
@@ -443,15 +440,22 @@ function sector(){return SECTORS[sectorIndex];}
 function d2(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
 
 function spawnEnemy(kind,x){
-  const drone=kind==='drone';
+  const typeConfig=GAME_CONFIG.enemyTypes[kind];
+  if(!typeConfig) throw new Error('Unknown enemy type: '+kind);
+  const size=typeConfig.size;
+  const movement=typeConfig.movement;
+  const attack=typeConfig.attack;
   enemies.push({
     kind,
     x,
-    y:drone?GAME_CONFIG.enemies.drone.y:G-GAME_CONFIG.enemies.infantry.height,
-    w:drone?GAME_CONFIG.enemies.drone.width:GAME_CONFIG.enemies.infantry.width,
-    h:drone?GAME_CONFIG.enemies.drone.height:GAME_CONFIG.enemies.infantry.height,
-    hp:GAME_CONFIG.enemies.hitPoints,
-    nextShotAt:performance.now()+1800,
+    anchorX:x,
+    patrolDirection:1,
+    y:movement.kind==='hover'?movement.y:G-size.height,
+    w:size.width,
+    h:size.height,
+    hp:typeConfig.hp,
+    attack,
+    nextShotAt:performance.now()+(attack.cooldownMs||0),
     dead:false, deathUntil:0
   });
   totalSpawn++;
@@ -586,18 +590,42 @@ function damagePlayer(now){
     playerDeathUntil=now+DEATH_EXPLOSION_MS;
   }
 }
-function updateDroneAttacks(now){
+function updateEnemyMovement(dt){
+  for(const e of enemies){
+    if(e.dead) continue;
+    const movement=GAME_CONFIG.enemyTypes[e.kind]?.movement;
+    if(!movement || movement.kind!=='hover' || !(movement.horizontalSpeed>0) || !(movement.patrolRange>0)) continue;
+    const minX=Math.max(0,e.anchorX-movement.patrolRange);
+    const maxX=Math.min(WORLD_W-e.w,e.anchorX+movement.patrolRange);
+    e.x += e.patrolDirection*movement.horizontalSpeed*dt;
+    if(e.x<=minX){e.x=minX;e.patrolDirection=1;}
+    else if(e.x>=maxX){e.x=maxX;e.patrolDirection=-1;}
+  }
+}
+
+function updateEnemyAttacks(now){
   if(phase!=='BATTLE' || player.dead) return;
   const s=sector();
+  const cameraX=Math.max(0,Math.min(WORLD_W-W,player.x-260));
   for(const e of enemies){
-    if(e.dead || e.kind!=='drone') continue;
+    // Enemy behavior is selected strictly by data. Contact-only infantry never emits projectiles.
+    const attack=e.attack;
+    if(e.dead || e.hp<=0 || e.kind!=='drone' || !attack || attack.kind!=='projectile') continue;
     if(e.x+e.w<s.start || e.x>s.end) continue;
+    // Do not start new attacks while the enemy is outside the visible camera viewport.
+    if(e.x+e.w < cameraX || e.x > cameraX+W) continue;
     if(now < e.nextShotAt) continue;
+    // Spawn from the drone's own body center, then aim at the player's center at firing time.
+    // The projectile keeps this velocity after launch; it does not home in on the player.
+    const muzzleX=e.x+e.w/2;
+    const muzzleY=e.y+e.h/2;
     const targetX=player.x+16;
-    const direction=targetX < e.x+e.w/2 ? -1 : 1;
-    // Horizontal projectile; sample the player's centerline at firing time.
-    enemyBullets.push({x:e.x+e.w/2,y:player.y+22,vx:direction*180,life:3000,damage:1});
-    e.nextShotAt=now+1800;
+    const targetY=player.y+GAME_CONFIG.player.height/2;
+    const dx=targetX-muzzleX;
+    const dy=targetY-muzzleY;
+    const distance=Math.hypot(dx,dy)||1;
+    enemyBullets.push({x:muzzleX,y:muzzleY,vx:(dx/distance)*attack.projectileSpeed,vy:(dy/distance)*attack.projectileSpeed,life:attack.projectileLifetimeMs,damage:attack.damage,sourceKind:e.kind,sourceEnemyId:e.id??null});
+    e.nextShotAt=now+droneFireIntervalMs;
   }
 }
 
@@ -607,7 +635,8 @@ function update(dt,now){
   if(!player.dead && input.isHeld('fire') && now-lastShot>GAME_CONFIG.combat.fireIntervalMs){fire();lastShot=now;}
 
   if(!player.dead) maintainSector(now,dt);
-  updateDroneAttacks(now);
+  updateEnemyMovement(dt);
+  updateEnemyAttacks(now);
 
   for(const b of bullets){
     b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt*1000;
@@ -625,6 +654,7 @@ function update(dt,now){
   const playerBoxForProjectile={x:player.x+4,y:player.y+4,w:24,h:40};
   for(const b of enemyBullets){
     b.x+=b.vx*dt;
+    b.y+=(b.vy||0)*dt;
     b.life-=dt*1000;
     if(!b.hit && !player.dead && overlaps(playerBoxForProjectile,{x:b.x-5,y:b.y-3,w:10,h:6})){
       damagePlayer(now);
@@ -632,7 +662,7 @@ function update(dt,now){
       b.life=0;
     }
   }
-  enemyBullets=enemyBullets.filter(b=>b.life>0 && b.x>=0 && b.x<=WORLD_W);
+  enemyBullets=enemyBullets.filter(b=>b.life>0 && b.x>=0 && b.x<=WORLD_W && b.y>=-40 && b.y<=H+40);
 
   // Enemy contact causes one HP damage; invulnerability prevents repeated frame damage.
   if(!player.dead && now>=player.invulnerableUntil){
@@ -683,7 +713,7 @@ function draw(){
   }
 
   for(const b of bullets){ctx.fillStyle='#f1e8b8';ctx.fillRect(b.x-cam-2,b.y-2,5,4);}
-  for(const b of enemyBullets){ctx.fillStyle='#ff5d73';ctx.fillRect(Math.round(b.x-cam-5),Math.round(b.y-3),10,6);ctx.fillStyle='#ffd3d8';ctx.fillRect(Math.round(b.x-cam-2),Math.round(b.y-1),4,2);}
+  for(const b of enemyBullets){ctx.save();ctx.translate(Math.round(b.x-cam),Math.round(b.y));ctx.rotate(Math.atan2(b.vy||0,b.vx));ctx.fillStyle='#ff5d73';ctx.fillRect(-5,-3,10,6);ctx.fillStyle='#ffd3d8';ctx.fillRect(-2,-1,4,2);ctx.restore();}
 
   // Sprite frame selection is visual-only; player physics/collision coordinates remain unchanged.
   let pose=0;
@@ -737,7 +767,7 @@ function draw(){
   document.getElementById('objectiveDesc').textContent=objective.description();
   document.getElementById('dashes').textContent=dashCount;
   document.getElementById('resetCount').textContent=resetCount;
-  document.title = `STEEL STRIDE — M7-A Integration Candidate — S${sectorIndex+1}`;
+  document.title = `STEEL STRIDE — M7-B.1 Formal Integration Candidate — S${sectorIndex+1}`;
 }
 
 function frame(now){
@@ -748,6 +778,9 @@ function frame(now){
 }
 input.bindCommand('reset',reset);
 document.getElementById('resetButton')?.addEventListener('click',reset);
+const droneFireIntervalInput=document.getElementById('droneFireInterval');
+const droneFireIntervalValue=document.getElementById('droneFireIntervalValue');
+droneFireIntervalInput.addEventListener('input',()=>{droneFireIntervalMs=Number(droneFireIntervalInput.value);droneFireIntervalValue.textContent=String(droneFireIntervalMs);});
 
 document.getElementById('applyObjective')?.addEventListener('click',()=>{
   const mode=document.getElementById('objectiveSelect')?.value || 'breakthrough';

@@ -15,6 +15,24 @@ window.GAME_CONFIG = Object.freeze({
     infantry: { width: 32, height: 32 },
     drone: { width: 30, height: 20, y: 145 }
   },
+  // M7-B.1: enemy differences live in data; engine behavior consumes these definitions.
+  enemyTypes: {
+    infantry: {
+      id: 'infantry', hp: 2,
+      size: { width: 32, height: 32 },
+      movement: { kind: 'ground' },
+      attack: { kind: 'contact', damage: 1 }
+    },
+    drone: {
+      id: 'drone', hp: 2,
+      size: { width: 30, height: 20 },
+      movement: { kind: 'hover', y: 145, horizontalSpeed: 45, patrolRange: 100 },
+      attack: {
+        kind: 'projectile', damage: 1,
+        cooldownMs: 1800, projectileSpeed: 180, projectileLifetimeMs: 3000
+      }
+    }
+  },
   sectors: [
     { start: 650, end: 1250, spawnLead: 520, wave: 8 },
     { start: 1750, end: 2400, spawnLead: 560, wave: 9 },
