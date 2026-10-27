@@ -7,14 +7,31 @@ window.GAME_CONFIG = Object.freeze({
     dashSpeed: 720, dashDuration: 0.22, dashCooldown: 0.65
   },
   combat: {
+    // Player weapon: muzzle position is relative to the player object.
     muzzleOffsetX: 18, muzzleOffsetY: 22, aimFallbackDistance: 420,
-    bulletSpeed: 500, bulletLifetimeMs: 2400, fireIntervalMs: 145
+    bulletSpeed: 500, bulletLifetimeMs: 2400, fireIntervalMs: 145,
+    damage: 1
+  },
+  playerHealth: {
+    maxHp: 3, hitFlashMs: 200, invulnerabilityMs: 1000, deathEffectMs: 650
   },
   enemies: {
-    hitPoints: 2, surviveSpawnInterval: 0.58,
-    infantry: { width: 32, height: 32 },
-    drone: { width: 30, height: 20, y: 145 },
-    turret: { width: 34, height: 50, range: 520, fireIntervalMs: 1800, bulletSpeed: 180, damage: 1 }
+    defaultHitPoints: 2, explosionMs: 500, surviveSpawnInterval: 0.58,
+    infantry: {
+      width: 32, height: 32,
+      contactDamage: 1,
+      rangedAttackEnabled: false
+    },
+    drone: {
+      width: 30, height: 20, y: 145, patrolSpeed: 85,
+      muzzleOffsetX: 15, muzzleOffsetY: 10,
+      bulletSpeed: 180, bulletLifetimeMs: 3000, fireIntervalMs: 1800, damage: 1
+    },
+    turret: {
+      width: 34, height: 50, range: 320, fireIntervalMs: 1800,
+      aimOriginOffsetX: 17, aimOriginOffsetY: 10,
+      muzzleLength: 30, bulletSpeed: 180, bulletLifetimeMs: 4000, damage: 1
+    }
   },
   sectors: [
     { start: 650, end: 1250, spawnLead: 520, wave: 8 },

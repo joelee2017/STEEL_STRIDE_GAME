@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>STEEL STRIDE — M7-B.2 Fixed Turret Integration Candidate v0.1</title>
+<title>STEEL STRIDE — M7-B.3 Combat Behavior Fix Candidate v0.2</title>
 <style>
 html,body{margin:0;background:#101214;color:#ddd;font-family:Consolas,monospace}
 body{display:flex;justify-content:center;padding:18px}
@@ -26,7 +26,7 @@ kbd{border:1px solid #666;padding:1px 5px;border-radius:3px;background:#25282b}
 <div class="wrap">
 <h1>STEEL STRIDE｜M7-B.2 固定砲台整合候選版 v0.1</h1>
 <div class="hint">
-<b>M7-B.2 整合候選版：</b>以 M7-B.1 已推送版本為基線，新增固定砲台的獨立索敵與遠距攻擊。此為候選版，尚未驗收或提交。
+<b>M7-B.4 戰鬥參數統一候選版：</b>以 M7-B.1 已推送版本為基線，新增固定砲台的獨立索敵與遠距攻擊。此為候選版，尚未驗收或提交。
 <br>固定砲台：射程 520 px、射擊間隔 1800 ms、子彈速度 180 px/s、傷害 1 HP；發射時取樣玩家位置，彈道固定。關卡目標與既有步兵／無人機行為保留。
 <br>操作：<kbd>A</kbd>/<kbd>D</kbd> 移動、<kbd>W</kbd>/<kbd>↑</kbd> 跳、<kbd>J</kbd>/<kbd>Z</kbd>/<kbd>SPACE</kbd> 射擊、<kbd>SHIFT</kbd>/<kbd>K</kbd>/<kbd>X</kbd> 衝刺、<kbd>R</kbd> 重置。
 </div>
@@ -75,8 +75,7 @@ const W=canvas.width,H=canvas.height,G=GAME_CONFIG.world.groundY,WORLD_W=GAME_CO
 const MECH_ATLAS_DATA='assets/mech.png';
 const HIT_SPRITE_DATA='assets/TYPE-01_Hit_64x56_v0_5.png';
 const DEATH_SPRITE_DATA='assets/TYPE-01_Death_Explosion_64x56_v0_1.png';
-const PLAYER_MAX_HP=3; // Test default; adjust after playtest if needed.
-const HIT_DURATION_MS=200;
+const PLAYER_MAX_HP=GAME_CONFIG.playerHealth.maxHp; const HIT_DURATION_MS=200;
 const PLAYER_INVULNERABLE_MS=1000;
 const DEATH_EXPLOSION_MS=650;
 const ENEMY_EXPLOSION_MS=500;
@@ -452,8 +451,10 @@ function spawnEnemy(kind,x){
     y:drone?spec.y:G-spec.height,
     w:spec.width,
     h:spec.height,
-    hp:GAME_CONFIG.enemies.hitPoints,
-    nextShotAt:performance.now()+(turret?900:1800),
+    hp:GAME_CONFIG.enemies.defaultHitPoints,
+    nextShotAt:performance.now()+(turret?spec.fireIntervalMs:(drone?spec.fireIntervalMs:0)),
+    // Drones patrol horizontally and reverse at the current Sector boundaries.
+    vx:drone?(Math.random()<0.5?-1:1)*spec.patrolSpeed:0,
     dead:false, deathUntil:0
   });
   totalSpawn++;
@@ -569,8 +570,14 @@ function chooseTarget(){
 }
 
 function fire(){
-  const ox=player.x+GAME_CONFIG.combat.muzzleOffsetX,oy=player.y+GAME_CONFIG.combat.muzzleOffsetY,t=chooseTarget();
-  const tx=t?t.x+t.w/2:ox+GAME_CONFIG.combat.aimFallbackDistance,ty=t?t.y+t.h/2:oy;
+  // The muzzle must follow the current facing direction. The sprite is mirrored
+  // around its center, so mirror the muzzle offset when facing left as well.
+  const muzzleOffsetX=GAME_CONFIG.combat.muzzleOffsetX;
+  const ox=player.x+(player.dir>=0?muzzleOffsetX:32-muzzleOffsetX);
+  const oy=player.y+GAME_CONFIG.combat.muzzleOffsetY;
+  const t=chooseTarget();
+  const tx=t?t.x+t.w/2:ox+player.dir*GAME_CONFIG.combat.aimFallbackDistance;
+  const ty=t?t.y+t.h/2:oy;
   const a=Math.atan2(ty-oy,tx-ox);
   bullets.push({x:ox,y:oy,vx:Math.cos(a)*GAME_CONFIG.combat.bulletSpeed,vy:Math.sin(a)*GAME_CONFIG.combat.bulletSpeed,life:GAME_CONFIG.combat.bulletLifetimeMs});
 }
@@ -580,7 +587,7 @@ function overlaps(a,b){
 }
 function damagePlayer(now){
   if(player.dead || now < player.invulnerableUntil) return;
-  player.hp=Math.max(0,player.hp-1);
+  player.hp=Math.max(0,player.hp-(GAME_CONFIG.enemies.infantry.contactDamage||1));
   player.hitUntil=now+HIT_DURATION_MS;
   player.invulnerableUntil=now+PLAYER_INVULNERABLE_MS;
   if(player.hp===0){
@@ -591,22 +598,40 @@ function damagePlayer(now){
 function updateEnemyAttacks(now){
   if(phase!=='BATTLE' || player.dead) return;
   const s=sector();
+  // Match draw()'s camera. Off-screen enemies must not initiate attacks.
+  const cam=Math.max(0,Math.min(WORLD_W-W,player.x-260));
+  const viewLeft=cam, viewRight=cam+W;
   for(const e of enemies){
     if(e.dead || (e.kind!=='drone' && e.kind!=='turret')) continue;
     if(e.x+e.w<s.start || e.x>s.end) continue;
+    if(e.x+e.w<viewLeft || e.x>viewRight) continue;
     if(now < e.nextShotAt) continue;
     if(e.kind==='drone'){
-      const targetX=player.x+16;
-      const direction=targetX < e.x+e.w/2 ? -1 : 1;
-      // Preserve M7-B.1 drone behavior: horizontal shot at firing-time player lane.
-      enemyBullets.push({x:e.x+e.w/2,y:player.y+22,vx:direction*180,vy:0,life:3000,damage:1});
-      e.nextShotAt=now+1800;
+      const spec=GAME_CONFIG.enemies.drone;
+      // Projectile origin is anchored to this drone; muzzle offsets are data in game-config.js.
+      const dir=e.vx<0?-1:1;
+      const ox=e.x+e.w/2+dir*spec.muzzleOffsetX;
+      const oy=e.y+spec.muzzleOffsetY;
+      const tx=player.x+16, ty=player.y+22;
+      const dx=tx-ox,dy=ty-oy,len=Math.hypot(dx,dy)||1;
+      enemyBullets.push({
+        x:ox,y:oy,vx:dx/len*spec.bulletSpeed,vy:dy/len*spec.bulletSpeed,
+        life:spec.bulletLifetimeMs,damage:spec.damage
+      });
+      e.nextShotAt=now+spec.fireIntervalMs;
     }else{
-      // Fixed turret samples the player's center at firing time; the projectile never homes.
-      const ox=e.x+e.w/2, oy=e.y+10, tx=player.x+16, ty=player.y+22;
-      const dx=tx-ox,dy=ty-oy,len=Math.hypot(dx,dy)||1, spec=GAME_CONFIG.enemies.turret;
+      // Fixed turret samples the player's center at firing time; projectile never homes.
+      // Aim origin and barrel length are all configured in game-config.js.
+      const spec=GAME_CONFIG.enemies.turret;
+      const ox=e.x+spec.aimOriginOffsetX, oy=e.y+spec.aimOriginOffsetY;
+      const tx=player.x+16, ty=player.y+22;
+      const dx=tx-ox,dy=ty-oy,len=Math.hypot(dx,dy)||1;
       if(Math.hypot(dx,dy)<=spec.range){
-        enemyBullets.push({x:ox,y:oy,vx:dx/len*spec.bulletSpeed,vy:dy/len*spec.bulletSpeed,life:4000,damage:spec.damage});
+        enemyBullets.push({
+          x:ox+dx/len*spec.muzzleLength,y:oy+dy/len*spec.muzzleLength,
+          vx:dx/len*spec.bulletSpeed,vy:dy/len*spec.bulletSpeed,
+          life:spec.bulletLifetimeMs,damage:spec.damage
+        });
         e.nextShotAt=now+spec.fireIntervalMs;
       }else{
         // Outside range: re-check shortly rather than spending a full firing interval.
@@ -622,6 +647,17 @@ function update(dt,now){
   if(!player.dead && input.isHeld('fire') && now-lastShot>GAME_CONFIG.combat.fireIntervalMs){fire();lastShot=now;}
 
   if(!player.dead) maintainSector(now,dt);
+
+  // Drone movement is independent of attack timing; keep the whole drone inside its Sector.
+  const activeSector=sector();
+  for(const e of enemies){
+    if(e.dead || e.kind!=='drone') continue;
+    e.x+=e.vx*dt;
+    const minX=activeSector.start, maxX=activeSector.end-e.w;
+    if(e.x<=minX){e.x=minX;e.vx=Math.abs(e.vx);}
+    else if(e.x>=maxX){e.x=maxX;e.vx=-Math.abs(e.vx);}
+  }
+
   updateEnemyAttacks(now);
 
   for(const b of bullets){
@@ -629,7 +665,7 @@ function update(dt,now){
     for(const e of enemies){
       if(e.dead) continue;
       if(Math.abs(b.x-(e.x+e.w/2))<e.w/2+4&&Math.abs(b.y-(e.y+e.h/2))<e.h/2+4){
-        e.hp--;b.life=0;
+        e.hp-=GAME_CONFIG.combat.damage;b.life=0;
         if(e.hp<=0){e.dead=true;e.deathUntil=now+ENEMY_EXPLOSION_MS;}
         break;
       }
@@ -694,11 +730,12 @@ function draw(){
   for(const e of enemies){
     if(e.dead){if(deathFrame){ctx.save();ctx.imageSmoothingEnabled=false;ctx.drawImage(deathFrame,Math.round(e.x-cam+(e.w-64)/2),Math.round(e.y+(e.h-56)/2));ctx.restore();}continue;}
     if(e.kind==='turret'){
-      const ox=e.x+e.w/2,oy=e.y+10,tx=player.x+16,ty=player.y+22;
+      const spec=GAME_CONFIG.enemies.turret;
+      const ox=e.x+spec.aimOriginOffsetX,oy=e.y+spec.aimOriginOffsetY,tx=player.x+16,ty=player.y+22;
       const angle=Math.atan2(ty-oy,tx-ox);
       ctx.fillStyle='#56666b';ctx.fillRect(e.x-cam,e.y+24,e.w,26);
       ctx.fillStyle='#9b7751';ctx.fillRect(e.x-cam+3,e.y+30,e.w-6,20);
-      ctx.save();ctx.translate(ox-cam,oy);ctx.rotate(angle);ctx.fillStyle='#9da8aa';ctx.fillRect(-4,-4,31,8);ctx.fillStyle='#d6b16a';ctx.fillRect(20,-2,10,4);ctx.restore();
+      ctx.save();ctx.translate(ox-cam,oy);ctx.rotate(angle);ctx.fillStyle='#9da8aa';ctx.fillRect(-4,-4,spec.muzzleLength+1,8);ctx.fillStyle='#d6b16a';ctx.fillRect(spec.muzzleLength-10,-2,10,4);ctx.restore();
       ctx.fillStyle='#d3a25e';ctx.fillRect(e.x-cam+5,e.y+3,24,8);
       ctx.fillStyle='#e5bd75';ctx.fillRect(e.x-cam+4,e.y-6,e.w-8,3);
     }else{
